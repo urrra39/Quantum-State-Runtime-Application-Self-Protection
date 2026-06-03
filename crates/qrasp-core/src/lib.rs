@@ -1,9 +1,3 @@
-//! qrasp-core
-//!
-//! Sof matematik va kvant holatlarini kuzatish yadrosi.
+//! Q-RASP core: state observation, metrics, and anomaly detection.
 
 pub mod observer;
-// Keyingi bosqichlarda qo'shiladigan modullar uchun joy:
-// pub mod metrics;
-// pub mod anomaly;
-// pub mod defense;
