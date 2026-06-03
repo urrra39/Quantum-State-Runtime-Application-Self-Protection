@@ -1,0 +1,15 @@
+[package]
+name = "qrasp-py"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "qrasp_native"
+crate-type = ["cdylib"]
+
+[dependencies]
+qrasp-core = { path = "../qrasp-core" }
+pyo3 = { version = "0.22", features = ["extension-module"] }
+numpy = "0.22"
+ndarray = "0.15"
+num-complex = "0.4"
