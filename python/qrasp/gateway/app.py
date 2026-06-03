@@ -14,7 +14,7 @@ from typing import Dict, List
 
 from fastapi import FastAPI
 
-from .schemas import AlertResponse, AnomalyEvent, AnomalyKind
+from .schemas import AlertResponse, AnomalyEvent, AnomalyKind, RollbackRecord
 
 app = FastAPI(
     title="Q-RASP Gateway",
@@ -25,8 +25,9 @@ app = FastAPI(
     version="0.1.0",
 )
 
-# In-memory event log, keyed by run_id. Swap for a durable store later.
+# In-memory logs, keyed by run_id. Swap for a durable store later.
 _EVENT_LOG: Dict[str, List[AnomalyEvent]] = defaultdict(list)
+_ROLLBACK_LOG: Dict[str, List[RollbackRecord]] = defaultdict(list)
 
 # Anomaly kinds that warrant escalation to active defense.
 _ESCALATING_KINDS = frozenset(
@@ -47,6 +48,17 @@ def ingest_event(event: AnomalyEvent) -> AlertResponse:
     _EVENT_LOG[event.run_id].append(event)
 
     escalated = event.kind in _ESCALATING_KINDS
+    if escalated:
+        # Record the defensive intervention so it can be exposed alongside the
+        # anomaly timeline. This closes the detection -> defense telemetry loop.
+        _ROLLBACK_LOG[event.run_id].append(
+            RollbackRecord(
+                run_id=event.run_id,
+                step=event.step,
+                triggered_by=event.kind,
+                purity=event.purity,
+            )
+        )
     message = (
         "active-defense trigger recommended" if escalated else "state nominal"
     )
@@ -57,3 +69,9 @@ def ingest_event(event: AnomalyEvent) -> AlertResponse:
 def get_run_events(run_id: str) -> List[AnomalyEvent]:
     """Return the recorded anomaly timeline for a given circuit run."""
     return _EVENT_LOG.get(run_id, [])
+
+
+@app.get("/v1/runs/{run_id}/rollbacks", response_model=List[RollbackRecord])
+def get_run_rollbacks(run_id: str) -> List[RollbackRecord]:
+    """Return the history of defensive rollback interventions for a run."""
+    return _ROLLBACK_LOG.get(run_id, [])

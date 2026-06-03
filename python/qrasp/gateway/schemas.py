@@ -41,3 +41,15 @@ class AlertResponse(BaseModel):
         ..., description="True if an active-defense trigger is recommended"
     )
     message: str
+
+
+class RollbackRecord(BaseModel):
+    """A recorded defensive intervention: the gateway recommended escalation
+    for an anomaly, so a state rollback was triggered for this step."""
+
+    run_id: str = Field(..., description="Logical id for one circuit execution")
+    step: int = Field(..., ge=0, description="Step at which rollback fired")
+    triggered_by: AnomalyKind = Field(
+        ..., description="The anomaly kind that triggered the rollback"
+    )
+    purity: float = Field(..., ge=0.0, le=1.0 + 1e-6)
