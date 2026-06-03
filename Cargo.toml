@@ -1,0 +1,5 @@
+[workspace]
+members = [
+    "crates/qrasp-core",
+]
+resolver = "2"
