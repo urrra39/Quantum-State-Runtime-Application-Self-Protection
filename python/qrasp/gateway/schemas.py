@@ -24,7 +24,9 @@ class AnomalyEvent(BaseModel):
     run_id: str = Field(..., description="Logical id for one circuit execution")
     step: int = Field(..., ge=0, description="Gate index / logical timestep")
     kind: AnomalyKind
-    purity: float = Field(..., ge=0.0, le=1.0)
+    # Upper bound carries a small tolerance: a reconstructed density matrix can
+    # yield purity marginally above 1.0 due to floating-point error.
+    purity: float = Field(..., ge=0.0, le=1.0 + 1e-6)
     trace: float
     delta: Optional[float] = Field(
         None, description="Purity drop magnitude between steps, if any"

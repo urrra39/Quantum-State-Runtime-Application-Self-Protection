@@ -69,6 +69,9 @@ class AnalysisReport:
     num_steps: int
     results: List[StepResult] = field(default_factory=list)
 
+    # Steps at which an escalation triggered a state rollback.
+    rollbacks: List[int] = field(default_factory=list)
+
     @property
     def anomalies(self) -> List[StepResult]:
         """Steps the observer did not classify as nominal."""
@@ -105,6 +108,7 @@ class QiskitObserverAdapter:
         self,
         purity_drop_threshold: float = 0.01,
         backend: Optional[Backend] = None,
+        gateway_url: Optional[str] = None,
     ) -> None:
         # Import the PyO3 core lazily so the module is importable even before
         # the Rust extension has been built (e.g. during pure-Python CI lint).
@@ -119,6 +123,10 @@ class QiskitObserverAdapter:
         self._StateObserver = StateObserver
         self._purity_drop_threshold = purity_drop_threshold
         self._backend = _resolve_backend(backend)
+        # Optional FastAPI gateway base URL (e.g. "http://localhost:8000").
+        # When set, the adapter POSTs events and honors the gateway's
+        # `escalated` decision; when unset, it escalates locally on any anomaly.
+        self._gateway_url = gateway_url.rstrip("/") if gateway_url else None
 
     # -- public API ---------------------------------------------------------
 
@@ -143,17 +151,21 @@ class QiskitObserverAdapter:
             num_steps=len(instructions),
         )
 
+        guard = StateGuard()
         for step, (name, qubit_indices) in enumerate(instructions):
             rho = self._density_matrix_after(circuit, step + 1)
             rho = np.ascontiguousarray(rho, dtype=np.complex128)
             event = observer.observe(step, rho)
+            # Clamp reconstructed purity into [0, 1] for reporting; tiny
+            # floating-point overshoots above 1.0 are physically meaningless.
+            reported_purity = float(np.clip(event.purity, 0.0, 1.0))
             report.results.append(
                 StepResult(
                     step=step,
                     gate=name,
                     qubits=qubit_indices,
                     kind=event.kind,
-                    purity=event.purity,
+                    purity=reported_purity,
                     trace=event.trace,
                     delta=event.delta,
                 )
@@ -163,6 +175,19 @@ class QiskitObserverAdapter:
                     "Q-RASP anomaly at step %d (%s on %s): %s (purity=%.6f)",
                     step, name, qubit_indices, event.kind, event.purity,
                 )
+                # Active defense: ask the policy whether to escalate, and if so
+                # roll the system back to the last known-nominal snapshot.
+                if self._escalate(event):
+                    restored = guard.rollback()
+                    if restored is not None:
+                        report.rollbacks.append(step)
+                        logger.warning(
+                            "Q-RASP rolled back step %d to last nominal snapshot "
+                            "(purity=%.6f)", step, guard.last_nominal_purity,
+                        )
+            else:
+                # Cache this clean state as a rollback target.
+                guard.snapshot(rho, event.purity)
 
         return report
 
@@ -218,3 +243,85 @@ class QiskitObserverAdapter:
         from qiskit.quantum_info import DensityMatrix
 
         return np.asarray(DensityMatrix(prefix).data, dtype=np.complex128)
+
+    # -- active defense -----------------------------------------------------
+
+    def _escalate(self, event) -> bool:
+        """Decide whether an anomaly warrants rollback.
+
+        If a gateway URL is configured, the gateway is authoritative: the
+        adapter POSTs the event and obeys the returned `escalated` flag. If the
+        gateway is unreachable, the adapter fails safe and escalates locally.
+        With no gateway configured, any anomaly escalates.
+        """
+        if self._gateway_url is None:
+            return True
+        try:
+            return self._report_to_gateway(event)
+        except Exception as exc:  # network/JSON errors -> fail safe
+            logger.warning("Gateway unreachable (%s); escalating locally.", exc)
+            return True
+
+    def _report_to_gateway(self, event, run_id: str = "adapter") -> bool:
+        """POST an anomaly event to the gateway and return its escalation flag.
+
+        Uses only the stdlib so the adapter has no hard HTTP dependency.
+        """
+        import json
+        import urllib.request
+
+        purity = float(np.clip(event.purity, 0.0, 1.0))
+        payload = json.dumps(
+            {
+                "run_id": run_id,
+                "step": int(event.step),
+                "kind": event.kind,
+                "purity": purity,
+                "trace": float(event.trace),
+                "delta": (None if event.delta is None else float(event.delta)),
+            }
+        ).encode("utf-8")
+        req = urllib.request.Request(
+            f"{self._gateway_url}/v1/events",
+            data=payload,
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            body = json.loads(resp.read().decode("utf-8"))
+        return bool(body.get("escalated", True))
+
+
+class StateGuard:
+    """Caches the last known-nominal density matrix and restores it on demand.
+
+    This is the simulator-side active-defense *mechanism*. On a classical
+    simulator a "rollback" is the faithful restoration of a previously captured
+    state vector / density matrix, which is a legitimate and demonstrable
+    capability (it is not a claim about physical QPU state restoration).
+
+    FUTURE RESEARCH GOAL (not implemented): error-correction *gate injection*,
+    i.e. synthesizing and applying corrective gates / a stabilizer round to
+    actively repair the state in place rather than discarding the corrupted
+    trajectory. This is meaningful only for specific code structures and is
+    deliberately out of scope here.
+    """
+
+    def __init__(self) -> None:
+        self._snapshot: Optional[np.ndarray] = None
+        self.last_nominal_purity: float = float("nan")
+
+    def snapshot(self, rho: np.ndarray, purity: float) -> None:
+        """Cache a copy of a known-nominal density matrix as a rollback target."""
+        self._snapshot = np.array(rho, dtype=np.complex128, copy=True)
+        self.last_nominal_purity = float(np.clip(purity, 0.0, 1.0))
+
+    def rollback(self) -> Optional[np.ndarray]:
+        """Return a copy of the last cached nominal state, or None if none."""
+        if self._snapshot is None:
+            return None
+        return np.array(self._snapshot, dtype=np.complex128, copy=True)
+
+    @property
+    def has_snapshot(self) -> bool:
+        return self._snapshot is not None

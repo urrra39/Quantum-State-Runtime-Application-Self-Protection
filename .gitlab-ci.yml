@@ -1,0 +1,40 @@
+# CI for Q-RASP-Engine: Rust core tests + maturin build + Python tests.
+stages:
+  - test
+
+# --- Rust core --------------------------------------------------------------
+rust:test:
+  stage: test
+  image: rust:1.79
+  cache:
+    key: cargo-$CI_COMMIT_REF_SLUG
+    paths:
+      - .cargo/
+      - target/
+  variables:
+    CARGO_HOME: $CI_PROJECT_DIR/.cargo
+  script:
+    - rustc --version && cargo --version
+    - cargo test -p qrasp-core --verbose
+
+# --- Python: build the native extension + run pytest ------------------------
+python:test:
+  stage: test
+  image: python:3.11-slim
+  cache:
+    key: pip-$CI_COMMIT_REF_SLUG
+    paths:
+      - .cache/pip/
+  variables:
+    PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
+  before_script:
+    # maturin needs a Rust toolchain to compile the PyO3 extension.
+    - apt-get update && apt-get install -y --no-install-recommends curl build-essential
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+    - . "$HOME/.cargo/env"
+    - python -m pip install --upgrade pip
+  script:
+    # Editable install builds qrasp.qrasp_native via the maturin backend and
+    # pulls in the gateway, qiskit, and dev (pytest/httpx) extras.
+    - pip install -e ".[gateway,qiskit,dev]"
+    - pytest tests/python/ -v
