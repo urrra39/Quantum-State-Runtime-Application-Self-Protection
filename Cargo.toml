@@ -1,5 +1,6 @@
 [workspace]
 members = [
     "crates/qrasp-core",
+    "crates/qrasp-py",
 ]
 resolver = "2"
