@@ -1,0 +1,61 @@
+# CI for Q-RASP-Engine: Rust core tests + maturin build + Python tests.
+stages:
+  - test
+
+# Shared cargo + build caches. The python:test job reuses the registry and the
+# compiled target/ dir produced by rust:test so the maturin build does not
+# recompile the Rust extension from scratch.
+.cargo_cache: &cargo_cache
+  key: cargo-$CI_COMMIT_REF_SLUG
+  paths:
+    - .cargo/registry/index/
+    - .cargo/registry/cache/
+    - .cargo/git/db/
+    - target/
+
+variables:
+  CARGO_HOME: $CI_PROJECT_DIR/.cargo
+
+# --- Rust core --------------------------------------------------------------
+rust:test:
+  stage: test
+  image: rust:1.79
+  cache:
+    <<: *cargo_cache
+    policy: pull-push
+  script:
+    - rustc --version && cargo --version
+    - cargo test -p qrasp-core --verbose
+
+# --- Python: build the native extension + run pytest ------------------------
+python:test:
+  stage: test
+  needs: ["rust:test"]
+  image: python:3.11-slim
+  cache:
+    # Reuse the cargo/target cache (pull only: this job does not own it) plus a
+    # dedicated pip cache.
+    - <<: *cargo_cache
+      policy: pull
+    - key: pip-$CI_COMMIT_REF_SLUG
+      paths:
+        - .cache/pip/
+  variables:
+    CARGO_HOME: $CI_PROJECT_DIR/.cargo
+    PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
+  before_script:
+    # maturin needs a Rust toolchain to compile the PyO3 extension. Because
+    # CARGO_HOME points at $CI_PROJECT_DIR/.cargo (for cache sharing), rustup
+    # writes its env file there, not to $HOME/.cargo.
+    - apt-get update && apt-get install -y --no-install-recommends curl build-essential
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+    - . "$CARGO_HOME/env"
+    - export PATH="$CARGO_HOME/bin:$PATH"
+    - rustc --version && cargo --version
+    - python -m pip install --upgrade pip
+  script:
+    # Editable install builds qrasp.qrasp_native via the maturin backend and
+    # pulls in the gateway, qiskit, and dev (pytest/httpx) extras. The shared
+    # target/ cache lets cargo reuse artifacts from rust:test.
+    - pip install -e ".[gateway,qiskit,dev]"
+    - pytest tests/python/ -v

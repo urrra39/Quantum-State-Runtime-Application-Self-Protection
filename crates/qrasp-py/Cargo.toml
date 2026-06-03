@@ -9,7 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 qrasp-core = { path = "../qrasp-core" }
-pyo3 = { version = "0.22", features = ["extension-module"] }
-numpy = "0.22"
+pyo3 = { version = "0.21", features = ["extension-module"] }
+numpy = "0.21"
 ndarray = "0.15"
 num-complex = "0.4"
