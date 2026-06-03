@@ -44,10 +44,14 @@ python:test:
     CARGO_HOME: $CI_PROJECT_DIR/.cargo
     PIP_CACHE_DIR: $CI_PROJECT_DIR/.cache/pip
   before_script:
-    # maturin needs a Rust toolchain to compile the PyO3 extension.
+    # maturin needs a Rust toolchain to compile the PyO3 extension. Because
+    # CARGO_HOME points at $CI_PROJECT_DIR/.cargo (for cache sharing), rustup
+    # writes its env file there, not to $HOME/.cargo.
     - apt-get update && apt-get install -y --no-install-recommends curl build-essential
-    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-    - . "$HOME/.cargo/env"
+    - curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path
+    - . "$CARGO_HOME/env"
+    - export PATH="$CARGO_HOME/bin:$PATH"
+    - rustc --version && cargo --version
     - python -m pip install --upgrade pip
   script:
     # Editable install builds qrasp.qrasp_native via the maturin backend and
