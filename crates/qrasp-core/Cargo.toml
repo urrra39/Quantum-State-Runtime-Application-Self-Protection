@@ -6,3 +6,10 @@ edition = "2021"
 [dependencies]
 ndarray = "0.15"
 num-complex = "0.4"
+
+# Integration tests in `tests/` are compiled as a separate crate and do not
+# inherit the library's regular dependencies, so the crates they construct
+# matrices with must be declared here too.
+[dev-dependencies]
+ndarray = "0.15"
+num-complex = "0.4"

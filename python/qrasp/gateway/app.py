@@ -14,7 +14,9 @@ from typing import Dict, List
 
 from fastapi import FastAPI
 
-from .schemas import AlertResponse, AnomalyEvent, AnomalyKind, RollbackRecord
+from qrasp.policies import EscalationPolicy
+
+from .schemas import AlertResponse, AnomalyEvent, RollbackRecord
 
 app = FastAPI(
     title="Q-RASP Gateway",
@@ -29,10 +31,9 @@ app = FastAPI(
 _EVENT_LOG: Dict[str, List[AnomalyEvent]] = defaultdict(list)
 _ROLLBACK_LOG: Dict[str, List[RollbackRecord]] = defaultdict(list)
 
-# Anomaly kinds that warrant escalation to active defense.
-_ESCALATING_KINDS = frozenset(
-    {AnomalyKind.PURITY_DROP, AnomalyKind.TRACE_VIOLATION}
-)
+# The escalation decision lives in the shared policy layer so the gateway and
+# the simulator-side bridge cannot disagree about what counts as an attack.
+_POLICY = EscalationPolicy()
 
 
 @app.get("/health")
@@ -47,8 +48,8 @@ def ingest_event(event: AnomalyEvent) -> AlertResponse:
     escalate to active defense (e.g. rollback / error-correction)."""
     _EVENT_LOG[event.run_id].append(event)
 
-    escalated = event.kind in _ESCALATING_KINDS
-    if escalated:
+    decision = _POLICY.decide(event.kind)
+    if decision.escalate:
         # Record the defensive intervention so it can be exposed alongside the
         # anomaly timeline. This closes the detection -> defense telemetry loop.
         _ROLLBACK_LOG[event.run_id].append(
@@ -59,10 +60,9 @@ def ingest_event(event: AnomalyEvent) -> AlertResponse:
                 purity=event.purity,
             )
         )
-    message = (
-        "active-defense trigger recommended" if escalated else "state nominal"
+    return AlertResponse(
+        accepted=True, escalated=decision.escalate, message=decision.reason
     )
-    return AlertResponse(accepted=True, escalated=escalated, message=message)
 
 
 @app.get("/v1/runs/{run_id}/events", response_model=List[AnomalyEvent])

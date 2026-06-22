@@ -1,93 +1,220 @@
-# q-rasp-engine
+# Q-RASP-Engine
 
+[![CI](https://github.com/urrra39/Quantum-State-Runtime-Application-Self-Protection/actions/workflows/ci.yml/badge.svg)](https://github.com/urrra39/Quantum-State-Runtime-Application-Self-Protection/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](./LICENSE)
+[![Python 3.9+](https://img.shields.io/badge/python-3.9%2B-blue.svg)](https://www.python.org/)
+[![Rust 2021](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 
+**Runtime Application Self-Protection (RASP) for quantum state.**
 
-## Getting started
+Q-RASP-Engine — the *Adversarial Quantum Emulation Sandbox* — watches a quantum
+system's density matrix `ρ` as a circuit executes and flags security-relevant
+anomalies in real time. A Rust core continuously checks two physical invariants,
+a shared policy layer decides whether an anomaly warrants intervention, and an
+active-defense mechanism can roll the system back to the last known-good state.
 
-To make it easy for you to get started with GitLab, here's a list of recommended next steps.
+This is a **research- and simulation-grade** engine. A "rollback" here is the
+faithful restoration of a previously captured *simulator* state — a real,
+demonstrable capability — **not** a claim about repairing physical QPU state in
+hardware. That distinction is deliberate and preserved throughout the codebase.
 
-Already a pro? Just edit this README.md and make it your own. Want to make it easy? [Use the template at the bottom](#editing-this-readme)!
+---
 
-## Add your files
+## Threat model
 
-* [Create](https://docs.gitlab.com/user/project/repository/web_editor/#create-a-file) or [upload](https://docs.gitlab.com/user/project/repository/web_editor/#upload-a-file) files
-* [Add files using the command line](https://docs.gitlab.com/topics/git/add_files/#add-files-to-a-git-repository) or push an existing Git repository with the following command:
+The protected asset is the **integrity and confidentiality of a quantum state in
+flight**. Two physical invariants of a density matrix expose the attacks we care
+about:
+
+- **Purity** `γ = Tr(ρ²)` ∈ `[1/d, 1]` — a pure state has `γ = 1`. Purity can
+  only *fall* when the system couples to an environment. A drop is the signature
+  of information leaking out (a side channel) or of decoherence being injected.
+- **Trace** `Tr(ρ)` — must remain `≈ 1.0` for any legitimate, trace-preserving
+  evolution. Deviation means the state was renormalized, cloned, truncated, or
+  otherwise tampered with by a non-trace-preserving operation.
+
+| Asset | Adversary capability | Observable | Core signal | Response |
+|-------|----------------------|------------|-------------|----------|
+| State confidentiality | Couple a subsystem to a hidden environment to siphon information (side channel) | Inter-step purity decreases beyond the configured tolerance | `purity_drop` | Escalate → rollback to last nominal snapshot |
+| State integrity (decoherence attack) | Inject a noise channel (e.g. depolarizing) to corrupt the computation | Sharp purity drop between consecutive steps | `purity_drop` | Escalate → rollback |
+| State integrity (tamper / clone) | Apply a non-trace-preserving op: unauthorized measurement, cloning, renormalization, truncation | `Tr(ρ)` departs from 1.0 beyond numerical tolerance | `trace_violation` | Escalate → rollback |
+| Normal operation | — | Stable purity, unit trace | `nominal` | Record telemetry, continue |
+
+**Detection is baseline-relative.** Each observation is compared against the
+*previous* step rather than an absolute threshold, so legitimately mixed states
+do not produce false positives — only an unexpected *change* trips the detector.
+The purity-drop threshold is configurable (default: 1% inter-step loss).
+
+**Trust boundary.** The Rust core and the in-process bridge are trusted: the core
+emits the canonical anomaly label, never the adversary. At the HTTP boundary the
+gateway re-validates every event against a strict `AnomalyKind` enum, so an
+attacker who can reach the gateway cannot inject an unknown `kind` to suppress
+escalation (a malformed event is rejected with HTTP 422). The escalation policy
+is an **allow-list** of escalating kinds — unknown input fails to the safe,
+non-escalating side and cannot *force* a self-inflicted rollback.
+
+## Detection & mitigation
+
+1. **Detect** — `crates/qrasp-core` (`StateObserver`) computes purity in `O(d²)`
+   via the Hermitian identity `Tr(ρ²) = Σ|ρ_ij|²` and classifies each step as
+   `nominal`, `purity_drop`, or `trace_violation`.
+2. **Decide** — `qrasp.policies.EscalationPolicy` is the single source of truth
+   for which anomaly kinds escalate. Both the local bridge and the gateway apply
+   the *same* policy, so a circuit analyzed in-process and one analyzed over HTTP
+   can never disagree about what counts as an attack.
+3. **Respond** — on escalation, `StateGuard` restores the last known-nominal
+   density matrix and the intervention is logged on the run's timeline. (The
+   restored state is recorded as a defensive action but not re-injected into the
+   trajectory; corrective re-execution / error-correction injection is a
+   documented future research goal.)
+4. **Harden** — gateway URLs are validated to `http(s)` hosts before use, so the
+   reporting path cannot be coerced into a `file://` read; an unreachable gateway
+   fails safe to the local policy.
+
+## Architecture
+
+The engine is split into four layers, each independently testable, with a
+strictly one-directional (acyclic) dependency graph:
 
 ```
-cd existing_repo
-git remote add origin https://gitlab.com/vip7771/q-rasp-engine.git
-git branch -M main
-git push -uf origin main
+                      quantum program (Qiskit QuantumCircuit)
+                                     │
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │ MONITORS  (Python)  qrasp.monitors  ──►  qrasp.bridge.qiskit_adapter  │
+   │   reconstruct ρ after every gate; stream snapshots into the core      │
+   └─────────────────────────────────────────────────────────────────────┘
+                                     │  ρ (NumPy complex128, d×d)
+                                     ▼
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │ PyO3 BRIDGE  (Rust)   crates/qrasp-py  →  module qrasp.qrasp_native   │
+   │   marshals NumPy complex arrays into ndarray; delegates to the core   │
+   └─────────────────────────────────────────────────────────────────────┘
+                                     │  Array2<Complex64>
+                                     ▼
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │ CORE  (Rust)   crates/qrasp-core  (src/observer.rs)                   │
+   │   StateObserver: O(d²) purity via the Hermitian identity, trace       │
+   │   check; classifies Anomaly = Nominal | PurityDrop | TraceViolation   │
+   └─────────────────────────────────────────────────────────────────────┘
+                                     │  AnomalyEvent(kind, step, purity, …)
+                                     ▼
+   ┌─────────────────────────────────────────────────────────────────────┐
+   │ POLICIES  (Python)   qrasp.policies.escalation                        │
+   │   EscalationPolicy: single source of truth for which anomaly kinds    │
+   │   escalate to active defense. Used by BOTH the bridge and the gateway │
+   └─────────────────────────────────────────────────────────────────────┘
+                       │ escalate?                    ▲ same policy
+                       ▼                              │
+   ┌──────────────────────────────┐   ┌──────────────────────────────────┐
+   │ active defense (in-process)  │   │ GATEWAY  (Python, FastAPI)        │
+   │ qrasp.bridge StateGuard      │   │ qrasp.gateway.app                 │
+   │   roll back to last nominal  │   │   POST /v1/events  (ingest+decide)│
+   │   snapshot; record rollback  │   │   GET  /v1/runs/{id}/events       │
+   └──────────────────────────────┘   │   GET  /v1/runs/{id}/rollbacks    │
+                                       │   GET  /health                    │
+                                       └──────────────────────────────────┘
 ```
 
-## Integrate with your tools
+**Data flow.** A monitor (`QiskitObserverAdapter`, re-exported via
+`qrasp.monitors`) instruments a `QuantumCircuit` by reconstructing the density
+matrix after each gate — using either the Aer `density_matrix` backend or pure
+`qiskit.quantum_info`, selected automatically. Each `ρ` crosses the PyO3 boundary
+(`crates/qrasp-py`) into the Rust core, where `StateObserver` computes purity and
+trace and returns a classification. The shared `EscalationPolicy` decides whether
+to escalate; when it fires, the in-process `StateGuard` restores the last
+known-nominal snapshot, and the gateway records the event and rollback on the
+run's timeline.
 
-* [Set up project integrations](https://gitlab.com/vip7771/q-rasp-engine/-/settings/integrations)
+## Quickstart
 
-## Collaborate with your team
+> **Prerequisite:** installing the package compiles the Rust core extension with
+> [maturin](https://www.maturin.rs/), so you need a **Rust toolchain**
+> ([rustup](https://rustup.rs/)) on your `PATH` in addition to Python 3.9+.
 
-* [Invite team members and collaborators](https://docs.gitlab.com/user/project/members/)
-* [Create a new merge request](https://docs.gitlab.com/user/project/merge_requests/creating_merge_requests/)
-* [Automatically close issues from merge requests](https://docs.gitlab.com/user/project/issues/managing_issues/#closing-issues-automatically)
-* [Enable merge request approvals](https://docs.gitlab.com/user/project/merge_requests/approvals/)
-* [Set auto-merge](https://docs.gitlab.com/user/project/merge_requests/auto_merge/)
+**1. Install (builds `qrasp.qrasp_native` via maturin):**
 
-## Test and Deploy
+```bash
+pip install -e ".[gateway,qiskit,dev]"
+```
 
-Use the built-in continuous integration in GitLab.
+**2. Run the diagnostics & alert gateway:**
 
-* [Get started with GitLab CI/CD](https://docs.gitlab.com/ci/quick_start/)
-* [Analyze your code for known vulnerabilities with Static Application Security Testing (SAST)](https://docs.gitlab.com/user/application_security/sast/)
-* [Deploy to Kubernetes, Amazon EC2, or Amazon ECS using Auto Deploy](https://docs.gitlab.com/topics/autodevops/requirements/)
-* [Use pull-based deployments for improved Kubernetes management](https://docs.gitlab.com/user/clusters/agent/)
-* [Set up protected environments](https://docs.gitlab.com/ci/environments/protected_environments/)
+```bash
+uvicorn qrasp.gateway.app:app --reload
+# GET http://127.0.0.1:8000/health  ->  {"status": "ok"}
+```
 
-***
+**3. Analyze a circuit for anomalies:**
 
-# Editing this README
+```python
+from qiskit import QuantumCircuit
+from qrasp.monitors import QiskitObserverAdapter
 
-When you're ready to make this README your own, just edit this file and use the handy template below (or feel free to structure it however you want - this is just a starting point!). Thanks to [makeareadme.com](https://www.makeareadme.com/) for this template.
+# A noiseless Bell circuit: should stay pure (no anomalies).
+circuit = QuantumCircuit(2)
+circuit.h(0)
+circuit.cx(0, 1)
 
-## Suggestions for a good README
+adapter = QiskitObserverAdapter(purity_drop_threshold=0.01)
+report = adapter.analyze(circuit, run_id="demo")
 
-Every project is different, so consider which of these sections apply to yours. The sections used in the template are suggestions for most open source projects. Also keep in mind that while a README can be too long and detailed, too long is better than too short. If you think your README is too long, consider utilizing another form of documentation rather than cutting out information.
+print(f"steps={report.num_steps}  anomalies={len(report.anomalies)}")
+for a in report.anomalies:
+    print(a.step, a.gate, a.kind, a.delta)   # purity_drop / trace_violation
+```
 
-## Name
-Choose a self-explaining name for your project.
+A clean Bell circuit reports **no anomalies** (purity stays ~1.0 throughout). To
+see a `purity_drop` fire, apply a depolarizing channel to the Bell state and feed
+the resulting density matrices straight into the core observer — see
+`tests/python/test_qiskit_adapter.py` for a backend-independent example using
+`quantum_info` Kraus operators.
 
-## Description
-Let people know what your project can do specifically. Provide context and add a link to any reference visitors might be unfamiliar with. A list of Features or a Background subsection can also be added here. If there are alternatives to your project, this is a good place to list differentiating factors.
+## Testing & CI
 
-## Badges
-On some READMEs, you may see small images that convey metadata, such as whether or not all the tests are passing for the project. You can use Shields to add some to your README. Many services also have instructions for adding a badge.
+```bash
+cargo test -p qrasp-core        # Rust core: unit + integration anomaly tests
+pytest tests/python/ -v         # Python: policies, monitors, gateway, rollback
+```
 
-## Visuals
-Depending on what you are making, it can be a good idea to include screenshots or even a video (you'll frequently see GIFs rather than actual videos). Tools like ttygif can help, but check out Asciinema for a more sophisticated method.
+The Python tests skip automatically if Qiskit or the compiled native extension
+are unavailable, so a pure-Python lint job never produces false failures.
 
-## Installation
-Within a particular ecosystem, there may be a common way of installing things, such as using Yarn, NuGet, or Homebrew. However, consider the possibility that whoever is reading your README is a novice and would like more guidance. Listing specific steps helps remove ambiguity and gets people to using your project as quickly as possible. If it only runs in a specific context like a particular programming language version or operating system or has dependencies that have to be installed manually, also add a Requirements subsection.
+CI runs on [GitHub Actions](./.github/workflows/ci.yml) on every push and PR to
+`main`:
 
-## Usage
-Use examples liberally, and show the expected output if you can. It's helpful to have inline the smallest example of usage that you can demonstrate, while providing links to more sophisticated examples if they are too long to reasonably include in the README.
+- **Rust** — `cargo test` (blocking), plus `rustfmt` and `clippy` (advisory).
+- **Python** — `ruff`, `mypy` (strict), `bandit` (SAST), and `pytest` (all
+  blocking) after a real maturin build of the native extension.
+- **Audits** — `cargo-audit` and `pip-audit` for dependency CVEs (advisory).
 
-## Support
-Tell people where they can go to for help. It can be any combination of an issue tracker, a chat room, an email address, etc.
+## Project layout
 
-## Roadmap
-If you have ideas for releases in the future, it is a good idea to list them in the README.
+```
+crates/
+  qrasp-core/        Rust: StateObserver, Anomaly classification (+ tests/)
+  qrasp-py/          Rust: PyO3 bindings -> module qrasp.qrasp_native
+python/qrasp/
+  monitors/          runtime monitors (facade over the Qiskit bridge)
+  bridge/            Qiskit adapter + StateGuard rollback mechanism
+  policies/          EscalationPolicy: the active-defense decision layer
+  gateway/           FastAPI diagnostics & alert gateway
+tests/python/        policies, monitors, gateway, rollback, contract tests
+.github/workflows/   CI: tests + security linters
+```
 
-## Contributing
-State if you are open to contributions and what your requirements are for accepting them.
+## Scope & limitations
 
-For people who want to make changes to your project, it's helpful to have some documentation on how to get started. Perhaps there is a script that they should run or some environment variables that they need to set. Make these steps explicit. These instructions could also be useful to your future self.
-
-You can also document commands to lint the code or run tests. These steps help to ensure high code quality and reduce the likelihood that the changes inadvertently break something. Having instructions for running tests is especially helpful if it requires external setup, such as starting a Selenium server for testing in a browser.
-
-## Authors and acknowledgment
-Show your appreciation to those who have contributed to the project.
+- **Simulation-grade.** Detection and rollback operate on simulated density
+  matrices. Rollback restores a captured simulator state; it does not repair a
+  physical QPU.
+- **Per-gate reconstruction is O(n) simulations** for an n-gate circuit (each
+  prefix is re-simulated), suitable for research-scale circuits, not large jobs.
+- **Hermiticity is assumed** by the `O(d²)` purity formula. The Qiskit path
+  always supplies Hermitian density matrices; arbitrary callers of the raw PyO3
+  `observe()` are responsible for supplying a valid density matrix.
+- **The gateway is a single-process diagnostics sink.** Its in-memory timelines
+  are not durable and not coherent across multiple workers.
 
 ## License
-For open source projects, say how it is licensed.
 
-## Project status
-If you have run out of energy or time for your project, put a note at the top of the README saying that development has slowed down or stopped completely. Someone may choose to fork your project or volunteer to step in as a maintainer or owner, allowing your project to keep going. You can also make an explicit request for maintainers.
+[MIT](./LICENSE) © Q-RASP-Engine contributors

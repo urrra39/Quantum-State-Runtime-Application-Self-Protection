@@ -1,8 +1,16 @@
 """Q-RASP-Engine: Adversarial Quantum Emulation Sandbox.
 
-This package provides the Python integration layer for the Rust core observer
-(exposed as the native extension ``qrasp.qrasp_native``), simulator bridges,
-and the FastAPI diagnostics & alert gateway.
+Runtime self-protection for quantum state. The engine is organized as four
+layers, separated so each can be tested and reasoned about in isolation:
+
+* **core** (Rust, ``qrasp.qrasp_native``) - classifies a density matrix:
+  purity ``Tr(rho^2)`` drops and trace violations.
+* **monitors** (:mod:`qrasp.monitors`) - instrument a running quantum program
+  and stream per-step snapshots into the core.
+* **policies** (:mod:`qrasp.policies`) - decide whether a classification
+  warrants an active-defense response (rollback / error-correction).
+* **gateway** (:mod:`qrasp.gateway`) - FastAPI diagnostics & alert sink that
+  records timelines and applies the policy over HTTP.
 """
 
 __version__ = "0.1.0"

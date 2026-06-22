@@ -25,8 +25,11 @@ import logging
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List, Optional
+from urllib.parse import urlparse
 
 import numpy as np
+
+from qrasp.policies import EscalationPolicy
 
 logger = logging.getLogger(__name__)
 
@@ -93,6 +96,26 @@ def _resolve_backend(prefer: Optional[Backend]) -> Backend:
         return Backend.QUANTUM_INFO
 
 
+def _validate_gateway_url(url: Optional[str]) -> Optional[str]:
+    """Normalize and validate a gateway base URL.
+
+    Returns the URL with any trailing slash stripped, or ``None`` if no URL was
+    supplied. Rejects non-HTTP(S) schemes and host-less URLs so a misconfigured
+    or tampered ``gateway_url`` cannot turn the anomaly-reporting POST into a
+    ``file://`` / custom-scheme read through ``urllib`` (CWE-22).
+    """
+    if not url:
+        return None
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise ValueError(
+            f"gateway_url must use http or https, got scheme {parsed.scheme!r}"
+        )
+    if not parsed.netloc:
+        raise ValueError("gateway_url must include a host")
+    return url.rstrip("/")
+
+
 class QiskitObserverAdapter:
     """Streams per-gate density matrices from a Qiskit circuit into the
     Rust ``StateObserver``.
@@ -109,6 +132,7 @@ class QiskitObserverAdapter:
         purity_drop_threshold: float = 0.01,
         backend: Optional[Backend] = None,
         gateway_url: Optional[str] = None,
+        policy: Optional[EscalationPolicy] = None,
     ) -> None:
         # Import the PyO3 core lazily so the module is importable even before
         # the Rust extension has been built (e.g. during pure-Python CI lint).
@@ -125,8 +149,13 @@ class QiskitObserverAdapter:
         self._backend = _resolve_backend(backend)
         # Optional FastAPI gateway base URL (e.g. "http://localhost:8000").
         # When set, the adapter POSTs events and honors the gateway's
-        # `escalated` decision; when unset, it escalates locally on any anomaly.
-        self._gateway_url = gateway_url.rstrip("/") if gateway_url else None
+        # `escalated` decision; when unset, it applies the local escalation
+        # policy directly. The URL is validated to an http(s) host so it cannot
+        # be coerced into a local-file read by the reporting call below.
+        self._gateway_url = _validate_gateway_url(gateway_url)
+        # Shared decision layer: the same policy the gateway applies, so local
+        # and gateway-mediated runs agree on what escalates.
+        self._policy = policy or EscalationPolicy()
 
     # -- public API ---------------------------------------------------------
 
@@ -177,13 +206,23 @@ class QiskitObserverAdapter:
                 )
                 # Active defense: ask the policy whether to escalate, and if so
                 # roll the system back to the last known-nominal snapshot.
-                if self._escalate(event):
+                if self._escalate(event, run_id):
                     restored = guard.rollback()
                     if restored is not None:
+                        # The restored matrix is recorded as a defensive
+                        # intervention but intentionally NOT re-injected into the
+                        # trajectory: faithful state restoration is demonstrated,
+                        # while corrective re-execution is the documented future
+                        # research goal (see StateGuard).
                         report.rollbacks.append(step)
                         logger.warning(
                             "Q-RASP rolled back step %d to last nominal snapshot "
                             "(purity=%.6f)", step, guard.last_nominal_purity,
+                        )
+                    else:
+                        logger.warning(
+                            "Q-RASP escalated step %d but had no nominal snapshot "
+                            "to restore.", step,
                         )
             else:
                 # Cache this clean state as a rollback target.
@@ -246,23 +285,26 @@ class QiskitObserverAdapter:
 
     # -- active defense -----------------------------------------------------
 
-    def _escalate(self, event) -> bool:
+    def _escalate(self, event, run_id: str) -> bool:
         """Decide whether an anomaly warrants rollback.
 
         If a gateway URL is configured, the gateway is authoritative: the
-        adapter POSTs the event and obeys the returned `escalated` flag. If the
-        gateway is unreachable, the adapter fails safe and escalates locally.
-        With no gateway configured, any anomaly escalates.
+        adapter POSTs the event (under the caller's ``run_id``) and obeys the
+        returned `escalated` flag. If the gateway is unreachable, the adapter
+        fails safe and applies the local escalation policy. With no gateway
+        configured, the local policy decides.
         """
         if self._gateway_url is None:
-            return True
+            return self._policy.should_escalate(event.kind)
         try:
-            return self._report_to_gateway(event)
+            return self._report_to_gateway(event, run_id)
         except Exception as exc:  # network/JSON errors -> fail safe
-            logger.warning("Gateway unreachable (%s); escalating locally.", exc)
-            return True
+            logger.warning(
+                "Gateway unreachable (%s); applying local policy.", exc
+            )
+            return self._policy.should_escalate(event.kind)
 
-    def _report_to_gateway(self, event, run_id: str = "adapter") -> bool:
+    def _report_to_gateway(self, event, run_id: str) -> bool:
         """POST an anomaly event to the gateway and return its escalation flag.
 
         Uses only the stdlib so the adapter has no hard HTTP dependency.
@@ -287,7 +329,9 @@ class QiskitObserverAdapter:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        # self._gateway_url scheme is validated to http(s) in
+        # _validate_gateway_url(), so this cannot open a file:// or custom scheme.
+        with urllib.request.urlopen(req, timeout=5) as resp:  # nosec B310
             body = json.loads(resp.read().decode("utf-8"))
         return bool(body.get("escalated", True))
 

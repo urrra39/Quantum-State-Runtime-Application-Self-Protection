@@ -28,6 +28,10 @@ dev = [
     "pytest>=8.0",
     "httpx>=0.27",
     "maturin>=1.5,<2.0",
+    "ruff>=0.5",
+    "mypy>=1.10",
+    "bandit>=1.7",
+    "pip-audit>=2.7",
 ]
 
 [tool.maturin]
@@ -35,3 +39,39 @@ manifest-path = "crates/qrasp-py/Cargo.toml"
 python-source = "python"
 module-name = "qrasp.qrasp_native"
 features = ["pyo3/extension-module"]
+include = ["python/qrasp/py.typed"]
+
+[tool.ruff]
+target-version = "py39"
+line-length = 88
+src = ["python", "tests"]
+
+[tool.ruff.lint]
+# pycodestyle, pyflakes, isort, flake8-bugbear, comprehensions, pyupgrade.
+select = ["E", "F", "I", "B", "C4", "UP"]
+# UP006/UP035/UP045 would rewrite typing.List/Dict/Optional to builtin and
+# PEP 604 syntax; keep the existing explicit-typing style consistently across
+# the codebase (some modules target runtime annotations without `__future__`).
+ignore = ["UP006", "UP035", "UP045"]
+
+[tool.mypy]
+python_version = "3.9"
+files = ["python/qrasp"]
+# qiskit / qiskit_aer ship no type stubs; don't fail on their missing imports.
+ignore_missing_imports = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+no_implicit_optional = true
+check_untyped_defs = true
+
+# Pin qiskit's contribution to Any in BOTH environments: it is absent in the
+# pure-Python dev/lint venv but present after `pip install -e .[qiskit]` in CI.
+# Skipping its imports keeps mypy's verdict identical in both places.
+[[tool.mypy.overrides]]
+module = ["qiskit.*", "qiskit_aer.*"]
+ignore_missing_imports = true
+follow_imports = "skip"
+
+[tool.bandit]
+# Tests legitimately use asserts and construct in-memory fixtures.
+exclude_dirs = ["tests", ".venv"]

@@ -1,0 +1,112 @@
+# CI for Q-RASP-Engine: Rust core + PyO3/maturin build + Python tests + linters.
+#
+# Mirrors the proven .gitlab-ci.yml maturin flow (rust:test -> python:test) and
+# adds security linters. Blocking gates: cargo test, ruff, mypy, bandit, pytest.
+# Advisory (continue-on-error) gates: rustfmt, clippy, and dependency audits --
+# these surface signal without breaking `main` on pre-existing formatting drift
+# or a freshly published advisory in a transitive dependency. Tighten them to
+# blocking once a formatting/lint pass has landed.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # --- Rust core: format, lint, unit + integration tests --------------------
+  rust:
+    name: Rust core
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Versions
+        run: rustc --version && cargo --version
+
+      - name: rustfmt (advisory)
+        continue-on-error: true
+        run: cargo fmt --all -- --check
+
+      - name: clippy (advisory)
+        continue-on-error: true
+        run: cargo clippy --workspace --all-targets
+
+      - name: Unit + integration tests
+        run: cargo test -p qrasp-core --verbose
+
+  # --- Python: build the native extension + lint + type-check + pytest ------
+  python:
+    name: Python layer
+    runs-on: ubuntu-latest
+    needs: [rust]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain (needed by maturin)
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo + target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install package + extras (builds qrasp.qrasp_native via maturin)
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[gateway,qiskit,dev]"
+
+      - name: ruff (lint)
+        run: ruff check python tests
+
+      - name: mypy (type-check)
+        run: mypy
+
+      - name: bandit (Python SAST)
+        run: bandit -q -c pyproject.toml -r python/qrasp
+
+      - name: pytest
+        run: pytest tests/python/ -v
+
+      - name: pip-audit (Python advisories, advisory)
+        continue-on-error: true
+        run: pip-audit --skip-editable
+
+  # --- Rust dependency vulnerability audit (advisory) -----------------------
+  cargo-audit:
+    name: cargo-audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: cargo-audit (Rust advisories)
+        continue-on-error: true
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit

@@ -1,0 +1,36 @@
+# --- Rust / Cargo ---
+/target/
+**/*.rs.bk
+Cargo.lock        # this is a library workspace; do not pin downstream builds
+
+# --- Python ---
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+build/
+dist/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+
+# Compiled native extension produced by maturin
+*.so
+*.pyd
+*.dll
+
+# --- Virtual environments ---
+.venv/
+venv/
+env/
+
+# --- Editor / OS ---
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
